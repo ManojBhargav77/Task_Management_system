@@ -1,0 +1,279 @@
+const taskModel = require('../models/taskModel');
+const commentModel = require('../models/commentModel');
+const groupMemberModel = require('../models/groupMemberModel');
+const notificationService = require('../services/notificationService');
+const { RULES: RECURRENCE_RULES, isValidRule, nextDueDate } = require('../utils/recurrence');
+const parseId = require('../utils/parseId');
+
+const STATUSES = ['todo', 'in_progress', 'done'];
+const PRIORITIES = ['low', 'medium', 'high'];
+
+// Validate a task payload. Returns an array of error strings (empty = valid).
+// `partial` skips checks for fields that weren't sent (used for PUT).
+function validateTask(body, partial = false) {
+  const errors = [];
+  if (!partial || body.title !== undefined) {
+    if (!body.title || typeof body.title !== 'string' || !body.title.trim()) {
+      errors.push('title is required');
+    } else if (body.title.length > 255) {
+      errors.push('title must be 255 chars or less');
+    }
+  }
+  if (body.status && !STATUSES.includes(body.status)) {
+    errors.push(`status must be one of: ${STATUSES.join(', ')}`);
+  }
+  if (body.priority && !PRIORITIES.includes(body.priority)) {
+    errors.push(`priority must be one of: ${PRIORITIES.join(', ')}`);
+  }
+  if (body.due_date && isNaN(Date.parse(body.due_date))) {
+    errors.push('due_date must be a valid date');
+  }
+  if (body.recurrence_rule !== undefined && body.recurrence_rule !== null
+      && body.recurrence_rule !== '' && !isValidRule(body.recurrence_rule)) {
+    errors.push(`recurrence_rule must be one of: ${RECURRENCE_RULES.join(', ')}`);
+  }
+  return errors;
+}
+
+async function createTask(req, res, next) {
+  try {
+    const errors = validateTask(req.body);
+    if (errors.length) return res.status(400).json({ errors });
+
+    // Group context — if group_id is set, the caller must be a member. If
+    // they want to assign the task to someone *else* (assignee_id), they
+    // must be owner/admin of the group. Plain members can only assign to
+    // themselves.
+    let assigneeId = req.user.id;
+    let groupId = null;
+    if (req.body.group_id) {
+      const gid = parseInt(req.body.group_id, 10);
+      if (!gid || gid <= 0) return res.status(400).json({ message: 'Invalid group_id' });
+      const role = await groupMemberModel.findUserRole(gid, req.user.id);
+      if (!role) return res.status(403).json({ message: 'Not a member of this group' });
+      groupId = gid;
+      if (req.body.assignee_id) {
+        const aid = parseInt(req.body.assignee_id, 10);
+        if (!aid || aid <= 0) return res.status(400).json({ message: 'Invalid assignee_id' });
+        if (aid !== req.user.id && role !== 'owner' && role !== 'admin') {
+          return res.status(403).json({ message: 'Only owners and admins can assign tasks to others' });
+        }
+        const targetIsMember = await groupMemberModel.isMember(gid, aid);
+        if (!targetIsMember) return res.status(400).json({ message: 'Assignee is not a member of this group' });
+        assigneeId = aid;
+      }
+    }
+
+    const task = await taskModel.create(assigneeId, {
+      ...req.body,
+      title: req.body.title.trim(),
+      group_id: groupId,
+    });
+    if (groupId) notificationService.notifyTaskShared(assigneeId, task);
+    res.status(201).json(task);
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function getAllTasks(req, res, next) {
+  try {
+    const {
+      status, priority, category_id, due_before, due_after,
+      sort_by, sort_order, limit, offset,
+    } = req.query;
+
+    const tasks = await taskModel.findAll({
+      userId: req.user.id,
+      status,
+      priority,
+      categoryId: category_id ? parseInt(category_id, 10) : undefined,
+      dueBefore: due_before,
+      dueAfter: due_after,
+      sortBy: sort_by,
+      sortOrder: sort_order,
+      limit: limit ? parseInt(limit, 10) : 50,
+      offset: offset ? parseInt(offset, 10) : 0,
+    });
+    res.json(tasks);
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function getTaskById(req, res, next) {
+  try {
+    const taskId = parseId(req.params.id);
+    if (taskId === null) return res.status(400).json({ message: 'Invalid task id' });
+    const task = await taskModel.findById(taskId, req.user.id);
+    if (!task) return res.status(404).json({ message: 'Task not found or no access' });
+    res.json(task);
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function updateTask(req, res, next) {
+  try {
+    const taskId = parseId(req.params.id);
+    if (taskId === null) return res.status(400).json({ message: 'Invalid task id' });
+    const canEdit = await taskModel.isOwnerOrEditor(taskId, req.user.id);
+    if (!canEdit) return res.status(403).json({ message: 'No permission to edit' });
+
+    const errors = validateTask(req.body, true);
+    if (errors.length) return res.status(400).json({ errors });
+
+    const before = await taskModel.findById(taskId, req.user.id);
+
+    // Reassignment: only group admins/owners can move a task to a different
+    // user, and the new assignee must already be in the same group.
+    if (req.body.owner_id !== undefined && req.body.owner_id !== before.owner_id) {
+      if (!before.group_id) {
+        return res.status(400).json({ message: 'Reassignment is only available on group tasks' });
+      }
+      const role = await groupMemberModel.findUserRole(before.group_id, req.user.id);
+      if (role !== 'owner' && role !== 'admin') {
+        return res.status(403).json({ message: 'Only group owners and admins can reassign tasks' });
+      }
+      const newAssigneeId = parseInt(req.body.owner_id, 10);
+      if (!await groupMemberModel.isMember(before.group_id, newAssigneeId)) {
+        return res.status(400).json({ message: 'Assignee is not in this group' });
+      }
+    } else if (req.body.owner_id !== undefined) {
+      // No actual change — drop the field so we don't pass it through.
+      delete req.body.owner_id;
+    }
+
+    const updated = await taskModel.update(taskId, req.body);
+    notificationService.notifyTaskUpdate(updated);
+
+    // If a recurring task just transitioned to "done", spawn the next instance
+    let spawned = null;
+    if (
+      before &&
+      before.is_recurring &&
+      isValidRule(before.recurrence_rule) &&
+      before.status !== 'done' &&
+      req.body.status === 'done'
+    ) {
+      const anchor = before.due_date ? new Date(before.due_date) : new Date();
+      const nextDate = nextDueDate(before.recurrence_rule, anchor);
+      if (nextDate) {
+        spawned = await taskModel.create(before.owner_id, {
+          title: before.title,
+          description: before.description,
+          priority: before.priority,
+          category_id: before.category_id,
+          is_recurring: true,
+          recurrence_rule: before.recurrence_rule,
+          estimated_time: before.estimated_time,
+          due_date: nextDate.toISOString(),
+        });
+      }
+    }
+
+    res.json(spawned ? { ...updated, spawned } : updated);
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function deleteTask(req, res, next) {
+  try {
+    const taskId = parseId(req.params.id);
+    if (taskId === null) return res.status(400).json({ message: 'Invalid task id' });
+    if (!(await taskModel.isOwner(taskId, req.user.id))) {
+      return res.status(403).json({ message: 'Only the owner can delete' });
+    }
+    await taskModel.remove(taskId);
+    notificationService.notifyTaskDeleted(taskId);
+    res.status(204).send();
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function searchTasks(req, res, next) {
+  try {
+    const { q, status, priority, category_id, limit, offset } = req.query;
+    const tasks = await taskModel.search({
+      query: q,
+      userId: req.user.id,
+      status,
+      priority,
+      categoryId: category_id ? parseInt(category_id, 10) : undefined,
+      limit: limit ? parseInt(limit, 10) : 50,
+      offset: offset ? parseInt(offset, 10) : 0,
+    });
+    res.json(tasks);
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function addComment(req, res, next) {
+  try {
+    const taskId = parseId(req.params.id);
+    if (taskId === null) return res.status(400).json({ message: 'Invalid task id' });
+    const { content } = req.body;
+
+    if (!content || typeof content !== 'string' || !content.trim()) {
+      return res.status(400).json({ errors: ['content required'] });
+    }
+    if (content.length > 5000) {
+      return res.status(400).json({ errors: ['content must be 5000 chars or less'] });
+    }
+
+    if (!(await taskModel.hasAccess(taskId, req.user.id))) {
+      return res.status(403).json({ message: 'No access to this task' });
+    }
+
+    const comment = await commentModel.create({
+      taskId,
+      userId: req.user.id,
+      content: content.trim(),
+    });
+    notificationService.notifyNewComment(taskId, comment);
+    res.status(201).json(comment);
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function getComments(req, res, next) {
+  try {
+    const taskId = parseId(req.params.id);
+    if (taskId === null) return res.status(400).json({ message: 'Invalid task id' });
+    if (!(await taskModel.hasAccess(taskId, req.user.id))) {
+      return res.status(403).json({ message: 'No access to this task' });
+    }
+    const comments = await commentModel.findByTaskId(taskId, {
+      limit: req.query.limit ? parseInt(req.query.limit, 10) : 100,
+      offset: req.query.offset ? parseInt(req.query.offset, 10) : 0,
+    });
+    res.json(comments);
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function deleteComment(req, res, next) {
+  try {
+    const commentId = parseId(req.params.commentId);
+    if (commentId === null) return res.status(400).json({ message: 'Invalid comment id' });
+    const comment = await commentModel.findById(commentId);
+    if (!comment) return res.status(404).json({ message: 'Comment not found' });
+    if (comment.user_id !== req.user.id) {
+      return res.status(403).json({ message: 'Only the author can delete' });
+    }
+    await commentModel.remove(commentId);
+    res.status(204).send();
+  } catch (err) {
+    next(err);
+  }
+}
+
+module.exports = {
+  createTask, getAllTasks, getTaskById, updateTask, deleteTask,
+  searchTasks, addComment, getComments, deleteComment,
+};
